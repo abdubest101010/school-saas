@@ -1,0 +1,620 @@
+// ============================================================
+// School Management SaaS — Prisma Schema (v2)
+// Roles: OWNER, ADMIN, TEACHER, PARENT, STUDENT
+// ============================================================
+//
+// Changes from the previous version:
+// 1. Fixed relation-name mismatch: Student.registeredBy <-> Admin.registeredStudents
+//    now both use "RegisteredBy" (this was a validation error before).
+// 2. Money fields (FeeStructure.amount, FeeInvoice.amount/paidAmount) changed
+//    from Float to Decimal(10,2) to avoid rounding issues on financial data.
+// 3. Subject.code is now unique per class section (@@unique([classSectionId, code]))
+//    instead of globally unique.
+// 4. Message.studentId is now a real relation with an index, instead of a
+//    loose unlinked string.
+// 5. Admin.hiredById and LeaveRequest.approvedBy are now proper relations
+//    instead of loose strings.
+// 6. onDelete behavior explicitly set on every relation (see inline comments
+//    for the reasoning on each one) — financial and audit records are
+//    Restrict, disposable/device-level data is Cascade, optional
+//    "soft link" fields are SetNull.
+// 7. Removed the redundant @@index([studentCode]) on Student (already
+//    indexed via @unique).
+// 8. Added PasswordResetToken model for real auth workflows.
+// ============================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "mysql"
+  url      = env("DATABASE_URL")
+}
+
+// ------------------ ENUMS ------------------
+
+enum Role {
+  OWNER
+  ADMIN
+  TEACHER
+  PARENT
+  STUDENT
+}
+
+enum AttendanceStatus {
+  PRESENT
+  ABSENT
+  LATE
+  EXCUSED
+}
+
+enum LeaveStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+enum Gender {
+  MALE
+  FEMALE
+  OTHER
+}
+
+enum FeeStatus {
+  PENDING
+  PARTIAL
+  PAID
+  OVERDUE
+}
+
+enum NotificationType {
+  EMAIL
+  SMS
+  PUSH
+  IN_APP
+}
+
+enum ExamType {
+  QUIZ
+  MIDTERM
+  FINAL
+  ASSIGNMENT
+  PROJECT
+}
+
+enum TermType {
+  FIRST
+  SECOND
+  THIRD
+  SUMMER
+}
+
+// ------------------ CORE USER MODELS ------------------
+
+model User {
+  id           String    @id @default(cuid())
+  email        String    @unique
+  passwordHash String
+  role         Role
+  isActive     Boolean   @default(true)
+  lastLogin    DateTime?
+  phone        String?
+  address      String?   @db.Text
+  profileImage String?
+  deletedAt    DateTime? // soft delete
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  owner   Owner?
+  admin   Admin?
+  teacher Teacher?
+  parent  Parent?
+  student Student?
+
+  sentMessages        Message[]             @relation("MessageSender")
+  notices             Notice[]              @relation("NoticeAuthor")
+  notificationTokens  NotificationToken[]
+  auditLogs           AuditLog[]            @relation("AuditUser")
+  readReceipts        MessageReadReceipt[]
+  notifications       Notification[]
+  passwordResetTokens PasswordResetToken[]
+}
+
+model Owner {
+  id         String   @id @default(cuid())
+  userId     String   @unique
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  schoolName String
+  createdAt  DateTime @default(now())
+}
+
+model Admin {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  createdAt DateTime @default(now())
+
+  // Self-relation: which admin hired this admin (optional — Owner may hire the first admins directly)
+  hiredById   String?
+  hiredBy     Admin?  @relation("AdminHiredBy", fields: [hiredById], references: [id], onDelete: SetNull)
+  hiredAdmins Admin[] @relation("AdminHiredBy")
+
+  registeredStudents    Student[]      @relation("RegisteredBy")
+  registeredTeachers    Teacher[]      @relation("HiredBy")
+  auditLogs             AuditLog[]     @relation("AuditAdmin")
+  approvedLeaveRequests LeaveRequest[] @relation("LeaveApprovedBy")
+
+  @@index([hiredById])
+}
+
+model Teacher {
+  id        String   @id @default(cuid())
+  userId    String   @unique
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name      String
+  subject   String?
+  hiredById String
+  // Restrict: an admin who has hired teachers can't be deleted out from under them
+  hiredBy   Admin    @relation("HiredBy", fields: [hiredById], references: [id], onDelete: Restrict)
+  createdAt DateTime @default(now())
+
+  classesTaught   ClassSection[]  @relation("ClassTeacher")
+  subjects        Subject[]
+  attendanceMarks Attendance[]
+  marksGiven      Mark[]          @relation("MarkTeacher")
+  behaviourNotes  BehaviourNote[]
+  examTeachers    Exam[]          @relation("ExamTeacher")
+
+  @@index([hiredById])
+}
+
+model Parent {
+  id         String    @id @default(cuid())
+  userId     String    @unique
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  name       String
+  phone      String?
+  occupation String?
+  createdAt  DateTime  @default(now())
+  children   Student[] @relation("ParentOfStudent")
+}
+
+model Student {
+  id             String        @id @default(cuid())
+  userId         String        @unique
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  studentCode    String        @unique
+  name           String
+  dateOfBirth    DateTime?
+  gender         Gender?
+  address        String?       @db.Text
+  classSectionId String?
+  // SetNull: if a class section is removed, the student stays enrolled at the school, just unassigned
+  classSection   ClassSection? @relation(fields: [classSectionId], references: [id], onDelete: SetNull)
+  parentId       String?
+  // SetNull: losing a linked parent record shouldn't delete the student
+  parent         Parent?       @relation("ParentOfStudent", fields: [parentId], references: [id], onDelete: SetNull)
+  registeredById String
+  // Restrict: preserve which admin registered the student
+  registeredBy   Admin         @relation("RegisteredBy", fields: [registeredById], references: [id], onDelete: Restrict)
+  enrollmentDate DateTime      @default(now())
+  graduationDate DateTime?
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  attendance     Attendance[]
+  marks          Mark[]              @relation("MarkStudent")
+  behaviourNotes BehaviourNote[]
+  feeInvoices    FeeInvoice[]
+  leaveRequests  LeaveRequest[]
+  enrollments    EnrollmentHistory[]
+  messages       Message[]
+
+  @@index([classSectionId])
+  @@index([parentId])
+  @@index([registeredById])
+}
+
+// ------------------ ACADEMIC STRUCTURE ------------------
+
+model AcademicYear {
+  id        String   @id @default(cuid())
+  name      String
+  startDate DateTime
+  endDate   DateTime
+  isCurrent Boolean  @default(false)
+  createdAt DateTime @default(now())
+
+  terms         Term[]
+  classSections ClassSection[]
+}
+
+model Term {
+  id             String       @id @default(cuid())
+  academicYearId String
+  // Restrict: don't allow deleting an academic year while terms still reference it
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Restrict)
+  termType       TermType
+  name           String
+  startDate      DateTime
+  endDate        DateTime
+  isCurrent      Boolean      @default(false)
+  createdAt      DateTime     @default(now())
+
+  timetables    TimetableEntry[]
+  exams         Exam[]
+  feeInvoices   FeeInvoice[]
+  attendance    Attendance[]
+  feeStructures FeeStructure[]
+
+  @@index([academicYearId])
+}
+
+model ClassSection {
+  id             String       @id @default(cuid())
+  name           String
+  academicYearId String
+  // Restrict: don't delete an academic year while class sections reference it
+  academicYear   AcademicYear @relation(fields: [academicYearId], references: [id], onDelete: Restrict)
+  teacherId      String?
+  // SetNull: removing a class teacher shouldn't delete the section
+  teacher        Teacher?     @relation("ClassTeacher", fields: [teacherId], references: [id], onDelete: SetNull)
+
+  students    Student[]
+  subjects    Subject[]
+  timetable   TimetableEntry[]
+  enrollments EnrollmentHistory[]
+
+  @@index([academicYearId])
+  @@index([teacherId])
+}
+
+model Subject {
+  id             String       @id @default(cuid())
+  name           String
+  code           String?
+  classSectionId String
+  // Cascade: subjects belong to a class section — no section, no subject
+  classSection   ClassSection @relation(fields: [classSectionId], references: [id], onDelete: Cascade)
+  teacherId      String?
+  // SetNull: losing the assigned teacher shouldn't delete the subject
+  teacher        Teacher?     @relation(fields: [teacherId], references: [id], onDelete: SetNull)
+
+  timetable TimetableEntry[]
+  exams     Exam[]
+
+  // Unique per class section rather than globally, so different sections
+  // (or different schools' data) can reuse the same subject code.
+  @@unique([classSectionId, code])
+  @@index([classSectionId])
+  @@index([teacherId])
+}
+
+model TimetableEntry {
+  id             String       @id @default(cuid())
+  termId         String?
+  // Cascade: timetable entries are meaningless once their term is gone
+  term           Term?        @relation(fields: [termId], references: [id], onDelete: Cascade)
+  classSectionId String
+  // Cascade: timetable entries belong to the section
+  classSection   ClassSection @relation(fields: [classSectionId], references: [id], onDelete: Cascade)
+  subjectId      String
+  // Cascade: timetable entries belong to the subject
+  subject        Subject      @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  dayOfWeek      Int
+  startTime      String
+  endTime        String
+  room           String?
+
+  @@index([termId])
+  @@index([classSectionId])
+  @@index([subjectId])
+}
+
+model EnrollmentHistory {
+  id             String       @id @default(cuid())
+  studentId      String
+  // Restrict: enrollment history is a record — don't let it vanish silently
+  student        Student      @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  classSectionId String
+  classSection   ClassSection @relation(fields: [classSectionId], references: [id], onDelete: Restrict)
+  enrolledAt     DateTime     @default(now())
+  leftAt         DateTime?
+  createdAt      DateTime     @default(now())
+
+  @@index([studentId])
+  @@index([classSectionId])
+}
+
+// ------------------ EXAMS ------------------
+
+model Exam {
+  id          String   @id @default(cuid())
+  name        String
+  examType    ExamType
+  subjectId   String
+  // Cascade: exams are meaningless without their subject
+  subject     Subject  @relation(fields: [subjectId], references: [id], onDelete: Cascade)
+  termId      String
+  // Cascade: exams belong to a specific term
+  term        Term     @relation(fields: [termId], references: [id], onDelete: Cascade)
+  teacherId   String
+  // Restrict: preserve which teacher set the exam
+  teacher     Teacher  @relation("ExamTeacher", fields: [teacherId], references: [id], onDelete: Restrict)
+  date        DateTime
+  maxScore    Float
+  weight      Float?
+  description String?  @db.Text
+  createdAt   DateTime @default(now())
+
+  marks Mark[] @relation("MarkExam")
+
+  @@index([subjectId])
+  @@index([termId])
+  @@index([teacherId])
+}
+
+// ------------------ DAILY OPERATIONS ------------------
+
+model Attendance {
+  id        String           @id @default(cuid())
+  studentId String
+  // Restrict: attendance is a historical record, keep it intact
+  student   Student          @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  teacherId String
+  // Restrict: preserve who marked attendance
+  teacher   Teacher          @relation(fields: [teacherId], references: [id], onDelete: Restrict)
+  termId    String?
+  // Restrict: don't let a term disappear while attendance still references it
+  term      Term?            @relation(fields: [termId], references: [id], onDelete: Restrict)
+  date      DateTime
+  status    AttendanceStatus
+  note      String?          @db.Text
+  createdAt DateTime         @default(now())
+
+  @@unique([studentId, date])
+  @@index([studentId])
+  @@index([teacherId])
+  @@index([termId])
+  @@index([date])
+}
+
+model Mark {
+  id        String   @id @default(cuid())
+  studentId String
+  // Restrict: grade records must be preserved
+  student   Student  @relation("MarkStudent", fields: [studentId], references: [id], onDelete: Restrict, map: "Mark_student_fkey")
+  examId    String
+  // Restrict: don't let an exam disappear while marks reference it
+  exam      Exam     @relation("MarkExam", fields: [examId], references: [id], onDelete: Restrict, map: "Mark_exam_fkey")
+  teacherId String
+  // Restrict: preserve who gave the mark
+  teacher   Teacher  @relation("MarkTeacher", fields: [teacherId], references: [id], onDelete: Restrict, map: "Mark_teacher_fkey")
+  score     Float
+  comment   String?  @db.Text
+  createdAt DateTime @default(now())
+
+  @@unique([studentId, examId])
+  @@index([studentId])
+  @@index([examId])
+  @@index([teacherId])
+}
+
+model BehaviourNote {
+  id         String   @id @default(cuid())
+  studentId  String
+  // Restrict: behaviour history should not silently disappear
+  student    Student  @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  teacherId  String
+  teacher    Teacher  @relation(fields: [teacherId], references: [id], onDelete: Restrict)
+  note       String   @db.Text
+  isPositive Boolean  @default(true)
+  date       DateTime @default(now())
+  createdAt  DateTime @default(now())
+
+  @@index([studentId])
+  @@index([teacherId])
+}
+
+// ------------------ FEES & INVOICES ------------------
+
+model FeeStructure {
+  id            String   @id @default(cuid())
+  name          String
+  description   String?  @db.Text
+  amount        Decimal  @db.Decimal(10, 2)
+  termId        String?
+  // Restrict: don't delete a term that fee structures still reference
+  term          Term?    @relation(fields: [termId], references: [id], onDelete: Restrict)
+  isRecurring   Boolean  @default(false)
+  dueDayOfMonth Int?
+  createdAt     DateTime @default(now())
+
+  invoices FeeInvoice[]
+
+  @@index([termId])
+}
+
+model FeeInvoice {
+  id             String        @id @default(cuid())
+  studentId      String
+  // Restrict: financial records must be kept
+  student        Student       @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  feeStructureId String?
+  feeStructure   FeeStructure? @relation(fields: [feeStructureId], references: [id], onDelete: Restrict)
+  termId         String?
+  term           Term?         @relation(fields: [termId], references: [id], onDelete: Restrict)
+  amount         Decimal       @db.Decimal(10, 2)
+  dueDate        DateTime
+  status         FeeStatus     @default(PENDING)
+  paidAmount     Decimal       @default(0) @db.Decimal(10, 2)
+  paidAt         DateTime?
+  paymentMethod  String?
+  transactionId  String?
+  notes          String?       @db.Text
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  @@index([studentId])
+  @@index([feeStructureId])
+  @@index([termId])
+  @@index([status])
+  @@index([dueDate])
+}
+
+// ------------------ COMMUNICATION ------------------
+
+model Message {
+  id            String   @id @default(cuid())
+  senderId      String
+  // Restrict: preserve message history even if the sender's user record is ever removed
+  sender        User     @relation("MessageSender", fields: [senderId], references: [id], onDelete: Restrict)
+  recipientRole Role?
+  studentId     String?
+  // SetNull: message stays even if the referenced student is removed
+  student       Student? @relation(fields: [studentId], references: [id], onDelete: SetNull)
+  subject       String
+  body          String   @db.Text
+  isUrgent      Boolean  @default(false)
+  createdAt     DateTime @default(now())
+
+  readReceipts MessageReadReceipt[]
+
+  @@index([senderId])
+  @@index([recipientRole])
+  @@index([studentId])
+}
+
+model MessageReadReceipt {
+  id        String   @id @default(cuid())
+  messageId String
+  // Cascade: receipts are meaningless once the message is gone
+  message   Message  @relation(fields: [messageId], references: [id], onDelete: Cascade)
+  userId    String
+  // Cascade: receipts are disposable metadata, fine to clear with the user
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  readAt    DateTime @default(now())
+
+  @@unique([messageId, userId])
+  @@index([userId])
+}
+
+model Notice {
+  id        String    @id @default(cuid())
+  authorId  String
+  // Restrict: preserve authorship of school-wide notices
+  author    User      @relation("NoticeAuthor", fields: [authorId], references: [id], onDelete: Restrict)
+  title     String
+  body      String    @db.Text
+  isPinned  Boolean   @default(false)
+  expiresAt DateTime?
+  createdAt DateTime  @default(now())
+  updatedAt DateTime  @updatedAt
+
+  audiences NoticeAudience[]
+
+  @@index([authorId])
+}
+
+model NoticeAudience {
+  id       String @id @default(cuid())
+  noticeId String
+  notice   Notice @relation(fields: [noticeId], references: [id], onDelete: Cascade)
+  role     Role
+
+  @@unique([noticeId, role])
+}
+
+// ------------------ NOTIFICATIONS & PUSH ------------------
+
+model NotificationToken {
+  id        String   @id @default(cuid())
+  userId    String
+  // Cascade: device tokens are disposable, clear them with the user
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String   @unique
+  platform  String // ios, android, web
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+}
+
+model Notification {
+  id     String           @id @default(cuid())
+  userId String
+  // Cascade: notifications only matter while the user exists
+  user   User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  type   NotificationType
+  title  String
+  body   String           @db.Text
+  data   Json?
+  isRead Boolean          @default(false)
+  sentAt DateTime         @default(now())
+  readAt DateTime?
+
+  @@index([userId])
+}
+
+// ------------------ AUTH ------------------
+
+model PasswordResetToken {
+  id        String    @id @default(cuid())
+  userId    String
+  // Cascade: reset tokens are meaningless once the user is gone
+  user      User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  token     String    @unique
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+// ------------------ LEAVE REQUESTS ------------------
+
+model LeaveRequest {
+  id           String      @id @default(cuid())
+  studentId    String
+  // Restrict: preserve leave history
+  student      Student     @relation(fields: [studentId], references: [id], onDelete: Restrict)
+  reason       String      @db.Text
+  fromDate     DateTime
+  toDate       DateTime
+  status       LeaveStatus @default(PENDING)
+  approvedById String?
+  // SetNull: losing the approving admin's record shouldn't delete the leave request
+  approvedBy   Admin?      @relation("LeaveApprovedBy", fields: [approvedById], references: [id], onDelete: SetNull)
+  approvedAt   DateTime?
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+
+  @@index([studentId])
+  @@index([status])
+  @@index([approvedById])
+}
+
+// ------------------ AUDIT LOG ------------------
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String
+  // Restrict: the audit trail must survive — hard-deleting a user with logs isn't allowed
+  // (use User.deletedAt for soft delete instead)
+  user       User     @relation("AuditUser", fields: [userId], references: [id], onDelete: Restrict)
+  adminId    String?
+  // SetNull: keep the log entry even if the acting admin's record is gone
+  admin      Admin?   @relation("AuditAdmin", fields: [adminId], references: [id], onDelete: SetNull)
+  action     String
+  entityType String
+  entityId   String?
+  changes    Json?
+  ipAddress  String?
+  userAgent  String?
+  createdAt  DateTime @default(now())
+
+  @@index([userId])
+  @@index([adminId])
+}
